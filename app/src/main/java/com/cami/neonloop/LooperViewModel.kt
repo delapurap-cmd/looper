@@ -1,6 +1,7 @@
 package com.cami.neonloop
 
 import android.app.Application
+import android.widget.Toast
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.lifecycle.AndroidViewModel
@@ -14,7 +15,7 @@ import kotlinx.coroutines.launch
 enum class TrackState { EMPTY, ARMED, RECORDING, PLAYING }
 
 class LooperViewModel(app: Application) : AndroidViewModel(app) {
-    private val engine = AudioEngine()
+    private val engine = AudioEngine(app)
     val mixer = Mixer()
     private val pm = ProjectManager(app)
     private val detector = TransientDetector()
@@ -26,21 +27,29 @@ class LooperViewModel(app: Application) : AndroidViewModel(app) {
     var selectedTrack = mutableStateOf(-1)   // para editor de pitch
     var mixerControlRevision = mutableStateOf(0)
     val trackLoopDurationsMs = mutableStateListOf(*Array(8) { 0 })
+    val savedProjects = mutableStateListOf<Project>()
 
     private val recordBuffer = ArrayList<Short>()
     private var recordingTrack = -1
+
+    private fun toast(msg: String) = viewModelScope.launch(Dispatchers.Main) {
+        Toast.makeText(getApplication(), msg, Toast.LENGTH_SHORT).show()
+    }
 
     // ---------- GRABACIÓN ----------
     /** Armar pista: empieza a escuchar; graba desde el PRIMER transiente. */
     fun armTrack(index: Int) {
         if (recordingTrack != -1) return
+        val hasHeadphones = engine.hasExternalAudioOutput()
+        engine.setMonitorGain(if (hasHeadphones) 1f else 0.18f)
+        if (!hasHeadphones) toast("Sin audifonos: monitor bajo para evitar sobregrabacion")
         recordingTrack = index
         trackStates[index] = TrackState.ARMED
         recordBuffer.clear()
         detector.reset()
         var started = false
         var samplesBeforeChunk = 0L
-        engine.startRecording { chunk ->
+        engine.startRecording(enableEchoCancel = !hasHeadphones) { chunk ->
             val hit = detector.process(chunk)
             if (!started && hit) {
                 started = true
@@ -55,15 +64,19 @@ class LooperViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Detiene grabación: cuantiza, detecta BPM si es el primer loop, y suena. */
+    /** Detiene grabación: limpia silencios, cuantiza, detecta BPM y suena. */
     fun stopRecording() {
         val index = recordingTrack
         if (index == -1) return
         engine.stopRecording()
+        engine.setMonitorGain(1f)
         recordingTrack = -1
 
         viewModelScope.launch(Dispatchers.Default) {
-            val raw = AudioTrimmer.trimStartToSound(recordBuffer.toShortArray())
+            // 1. Quita silencio del inicio
+            var raw = AudioTrimmer.trimStartToSound(recordBuffer.toShortArray())
+            // 2. Quita el silencio del final (lo que tardaste en presionar parar)
+            raw = AudioTrimmer.trimEndToSound(raw)
             if (raw.isEmpty()) { trackStates[index] = TrackState.EMPTY; return@launch }
             val onsets = detectOnsets(raw)
 
@@ -74,11 +87,13 @@ class LooperViewModel(app: Application) : AndroidViewModel(app) {
                 project.value.bpm = bpm.value
             }
 
-            val quantized = Quantizer.quantizeLoop(raw, bpm.value, onsets)
+            // 3. Redondea al beat más cercano: loop cerrado, sin hueco
+            val quantized = Quantizer.quantizeLoop(raw, bpm.value)
 
             pm.trackFile(project.value, index).also { WavIO.write(it, quantized) }
             project.value.tracks[index].loopFile = "track_$index.wav"
 
+            engine.setMonitorGain(1f)
             applyTrackProcessing(index, quantized)
             trackStates[index] = TrackState.PLAYING
             if (!isPlaying.value) play()
@@ -125,8 +140,8 @@ class LooperViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ---------- TRANSPORTE ----------
-    fun play() { if (!isPlaying.value) { engine.startPlayback(mixer); isPlaying.value = true } }
-    fun stop() { engine.stopPlayback(); isPlaying.value = false; mixer.resetPositions() }
+    fun play() { if (!isPlaying.value) { engine.setMonitorGain(1f); engine.startPlayback(mixer); isPlaying.value = true } }
+    fun stop() { engine.setMonitorGain(1f); engine.stopPlayback(); isPlaying.value = false; mixer.resetPositions() }
 
     // ---------- MIXER ----------
     fun setVolume(i: Int, v: Float) { project.value.tracks[i].volume = v; mixer.slots[i].volume = v }
@@ -141,8 +156,40 @@ class LooperViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ---------- PROYECTOS ----------
-    fun saveProject() = viewModelScope.launch(Dispatchers.IO) { pm.save(project.value) }
-    fun listProjects() = pm.listProjects()
+    fun refreshProjects() = viewModelScope.launch(Dispatchers.IO) {
+        val list = pm.listProjects()
+        savedProjects.clear()
+        savedProjects.addAll(list)
+    }
+
+    fun renameProject(name: String) {
+        if (name.isNotBlank()) project.value.name = name.trim()
+    }
+
+    fun saveProject() = viewModelScope.launch(Dispatchers.IO) {
+        pm.save(project.value)
+        refreshProjects()
+        toast("Proyecto \"${project.value.name}\" guardado")
+    }
+
+    fun deleteProject(id: String) = viewModelScope.launch(Dispatchers.IO) {
+        pm.delete(id)
+        refreshProjects()
+        toast("Proyecto borrado")
+    }
+
+    fun newProjectAndLoad(name: String = "Proyecto ${savedProjects.size + 1}") {
+        stop()
+        project.value = pm.newProject(name)
+        bpm.value = 0f
+        for (i in 0..7) {
+            mixer.setTrackBuffer(i, null)
+            trackLoopDurationsMs[i] = 0
+            trackStates[i] = TrackState.EMPTY
+        }
+        mixerControlRevision.value++
+    }
+
     fun loadProject(id: String) {
         viewModelScope.launch(Dispatchers.IO) {
             val p = pm.load(id) ?: return@launch
@@ -154,13 +201,29 @@ class LooperViewModel(app: Application) : AndroidViewModel(app) {
                     val f = pm.trackFile(p, i)
                     if (f.exists()) { applyTrackProcessing(i, WavIO.read(f)); trackStates[i] = TrackState.PLAYING }
                     else trackStates[i] = TrackState.EMPTY
-                } else { mixer.setTrackBuffer(i, null); trackStates[i] = TrackState.EMPTY }
+                } else {
+                    mixer.setTrackBuffer(i, null)
+                    trackLoopDurationsMs[i] = 0
+                    trackStates[i] = TrackState.EMPTY
+                }
             }
+            toast("Proyecto \"${p.name}\" cargado")
         }
     }
 
+    // ---------- EXPORT ----------
     fun exportMix() = viewModelScope.launch(Dispatchers.IO) {
-        val f = java.io.File(pm.exportDir, "${project.value.name}_mix.wav")
+        val hasLoops = mixer.slots.any { it.buffer != null }
+        if (!hasLoops) { toast("No hay loops para exportar"); return@launch }
+
+        val wasPlaying = isPlaying.value
+        if (wasPlaying) stop()
+
+        val safeName = project.value.name.replace(Regex("[^a-zA-Z0-9_\\- ]"), "_")
+        val f = java.io.File(pm.exportDir, "${safeName}_mix.wav")
         Exporter.exportWav(mixer, f)
+        toast("Exportado: ${f.name}\n(Android/data/com.cami.neonloop/files/exports)")
+
+        if (wasPlaying) play()
     }
 }

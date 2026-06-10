@@ -33,6 +33,7 @@ import com.cami.neonloop.ui.theme.Neon
 fun LooperScreen(vm: LooperViewModel) {
     var showMixer by remember { mutableStateOf(false) }
     var showPitch by remember { mutableStateOf(false) }
+    var showProjects by remember { mutableStateOf(false) }
 
     Column(
         Modifier.fillMaxSize().background(Neon.Bg).padding(16.dp)
@@ -72,11 +73,12 @@ fun LooperScreen(vm: LooperViewModel) {
         }
 
         Spacer(Modifier.height(16.dp))
-        TransportBar(vm, onMixer = { showMixer = true })
+        TransportBar(vm, onMixer = { showMixer = true }, onProjects = { showProjects = true })
     }
 
     if (showMixer) MixerSheet(vm) { showMixer = false }
     if (showPitch && vm.selectedTrack.value >= 0) PitchSheet(vm) { showPitch = false }
+    if (showProjects) ProjectSheet(vm) { showProjects = false }
 }
 
 @Composable
@@ -85,12 +87,15 @@ private fun Header(vm: LooperViewModel) {
         Text("NEON", color = Neon.Cyan, fontSize = 24.sp, fontWeight = FontWeight.Black)
         Text("LOOP", color = Neon.Magenta, fontSize = 24.sp, fontWeight = FontWeight.Black)
         Spacer(Modifier.weight(1f))
-        val bpm = vm.bpm.value
-        Text(
-            if (bpm > 0f) "${bpm.toInt()} BPM" else "-- BPM",
-            color = if (bpm > 0f) Neon.Green else Neon.TextDim,
-            fontSize = 18.sp, fontWeight = FontWeight.Bold
-        )
+        Column(horizontalAlignment = Alignment.End) {
+            val bpm = vm.bpm.value
+            Text(
+                if (bpm > 0f) "${bpm.toInt()} BPM" else "-- BPM",
+                color = if (bpm > 0f) Neon.Green else Neon.TextDim,
+                fontSize = 18.sp, fontWeight = FontWeight.Bold
+            )
+            Text(vm.project.value.name, color = Neon.TextDim, fontSize = 11.sp)
+        }
     }
 }
 
@@ -171,7 +176,7 @@ private fun PadControl(text: String, color: Color, onClick: () -> Unit) {
 }
 
 @Composable
-private fun TransportBar(vm: LooperViewModel, onMixer: () -> Unit) {
+private fun TransportBar(vm: LooperViewModel, onMixer: () -> Unit, onProjects: () -> Unit) {
     Row(
         Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceEvenly,
@@ -181,8 +186,7 @@ private fun TransportBar(vm: LooperViewModel, onMixer: () -> Unit) {
             if (vm.isPlaying.value) vm.stop() else vm.play()
         }
         NeonButton("MIX", Neon.Cyan, onMixer)
-        NeonButton("💾", Neon.Magenta) { vm.saveProject() }
-        NeonButton("WAV", Neon.Amber) { vm.exportMix() }
+        NeonButton("📁", Neon.Magenta, onProjects)
     }
 }
 
