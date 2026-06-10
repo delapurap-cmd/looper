@@ -20,5 +20,7 @@ data class Track(
     var muted: Boolean = false,
     var solo: Boolean = false,
     var pitchSemitones: Float = 0f, // -12..+12
-    var stretchToBpm: Boolean = true // warp automático al BPM del proyecto
+    var stretchToBpm: Boolean = true, // warp automático al BPM del proyecto
+    var abStart: Float = 0f,      // selector A: inicio de reproducción (0..1)
+    var abEnd: Float = 1f         // selector B: fin de reproducción (0..1)
 )

@@ -28,6 +28,9 @@ class LooperViewModel(app: Application) : AndroidViewModel(app) {
     var mixerControlRevision = mutableStateOf(0)
     val trackLoopDurationsMs = mutableStateListOf(*Array(8) { 0 })
     val savedProjects = mutableStateListOf<Project>()
+    /** Onda dibujable por pista: 240 picos normalizados 0..1 (null = sin loop). */
+    val trackWaveforms = mutableStateListOf<FloatArray?>(*arrayOfNulls<FloatArray>(8))
+    var waveformRevision = mutableStateOf(0)
 
     private val recordBuffer = ArrayList<Short>()
     private var recordingTrack = -1
@@ -117,7 +120,10 @@ class LooperViewModel(app: Application) : AndroidViewModel(app) {
         var buf = raw
         if (t.pitchSemitones != 0f) buf = PitchShifter.pitchShift(buf, t.pitchSemitones)
         mixer.setTrackBuffer(index, buf)
-        trackLoopDurationsMs[index] = ((buf.size * 1000L) / AudioEngine.SAMPLE_RATE).toInt().coerceAtLeast(120)
+        mixer.setRegion(index, t.abStart, t.abEnd)
+        trackWaveforms[index] = buildWaveform(buf)
+        waveformRevision.value++
+        updateLoopDuration(index)
         mixer.slots[index].volume = t.volume
         mixer.slots[index].pan = t.pan
         mixer.slots[index].muted = t.muted
@@ -133,6 +139,10 @@ class LooperViewModel(app: Application) : AndroidViewModel(app) {
 
     fun clearTrack(index: Int) {
         mixer.setTrackBuffer(index, null)
+        trackWaveforms[index] = null
+        waveformRevision.value++
+        project.value.tracks[index].abStart = 0f
+        project.value.tracks[index].abEnd = 1f
         trackLoopDurationsMs[index] = 0
         project.value.tracks[index].loopFile = null
         trackStates[index] = TrackState.EMPTY
@@ -148,6 +158,43 @@ class LooperViewModel(app: Application) : AndroidViewModel(app) {
     fun setPan(i: Int, v: Float) { project.value.tracks[i].pan = v; mixer.slots[i].pan = v }
     fun toggleMute(i: Int) { val t = project.value.tracks[i]; t.muted = !t.muted; mixer.slots[i].muted = t.muted; mixerControlRevision.value++ }
     fun toggleSolo(i: Int) { val t = project.value.tracks[i]; t.solo = !t.solo; mixer.slots[i].solo = t.solo; mixerControlRevision.value++ }
+
+    // ---------- SELECTOR A-B ----------
+    /** El usuario mueve A o B en el carril: el audio loopea solo esa región. */
+    fun setAB(index: Int, start: Float, end: Float) {
+        val t = project.value.tracks[index]
+        t.abStart = start.coerceIn(0f, 1f)
+        t.abEnd = end.coerceIn(t.abStart, 1f)
+        mixer.setRegion(index, t.abStart, t.abEnd)
+        updateLoopDuration(index)
+    }
+
+    private fun updateLoopDuration(index: Int) {
+        val s = mixer.slots[index]
+        val len = (s.endPos - s.startPos).coerceAtLeast(1)
+        trackLoopDurationsMs[index] = ((len * 1000L) / AudioEngine.SAMPLE_RATE).toInt().coerceAtLeast(120)
+    }
+
+    /** Reduce el audio a 240 picos para dibujar la onda. */
+    private fun buildWaveform(buf: ShortArray, bins: Int = 240): FloatArray {
+        if (buf.isEmpty()) return FloatArray(bins)
+        val out = FloatArray(bins)
+        val step = (buf.size.toFloat() / bins).coerceAtLeast(1f)
+        var maxPeak = 1f
+        for (b in 0 until bins) {
+            val from = (b * step).toInt().coerceAtMost(buf.size - 1)
+            val to = ((b + 1) * step).toInt().coerceAtMost(buf.size)
+            var peak = 0
+            for (i in from until to) {
+                val a = kotlin.math.abs(buf[i].toInt())
+                if (a > peak) peak = a
+            }
+            out[b] = peak.toFloat()
+            if (peak > maxPeak) maxPeak = peak.toFloat()
+        }
+        for (b in 0 until bins) out[b] = out[b] / maxPeak
+        return out
+    }
 
     // ---------- PITCH ----------
     fun setPitch(i: Int, semitones: Float) {
@@ -184,9 +231,11 @@ class LooperViewModel(app: Application) : AndroidViewModel(app) {
         bpm.value = 0f
         for (i in 0..7) {
             mixer.setTrackBuffer(i, null)
+            trackWaveforms[i] = null
             trackLoopDurationsMs[i] = 0
             trackStates[i] = TrackState.EMPTY
         }
+        waveformRevision.value++
         mixerControlRevision.value++
     }
 
@@ -203,6 +252,7 @@ class LooperViewModel(app: Application) : AndroidViewModel(app) {
                     else trackStates[i] = TrackState.EMPTY
                 } else {
                     mixer.setTrackBuffer(i, null)
+                    trackWaveforms[i] = null
                     trackLoopDurationsMs[i] = 0
                     trackStates[i] = TrackState.EMPTY
                 }
